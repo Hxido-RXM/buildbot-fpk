@@ -10,12 +10,149 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
 }
 
+# ---------------------------------------------------------------------------
+# Port handling (route 1: the fnOS install wizard is the single source of truth)
+#
+# The wizard field "ui_port" is injected by fnOS as a shell variable of the
+# same name.  Emby has no --port switch; its listening port lives only in
+# <programdata>/config/system.xml (PublicPort + HttpServerPortNumber).
+# On every start we therefore make those two fields match ${ui_port}.
+#
+# Encoding note: Emby's XmlSerializer writes UTF-8 while the content is pure
+# ASCII, but switches to UTF-16 once non-ASCII text is stored (e.g. a library
+# path with CJK characters).  A byte-oriented sed silently does nothing on
+# UTF-16, so we detect the encoding first and fall back to python3, and we
+# always verify the result instead of trusting the editor's exit code.
+# ---------------------------------------------------------------------------
+sync_emby_port() {
+    local port="$1"
+    local xml="${EMBY_DATA}/config/system.xml"
+
+    mkdir -p "${EMBY_DATA}/config"
+
+    if [ ! -f "${xml}" ]; then
+        # First start: pre-seed a minimal configuration so Emby binds `port`
+        # straight away (and never generates a 8096 default).
+        cat > "${xml}" <<XMLEOF
+<?xml version="1.0"?>
+<ServerConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <PublicPort>${port}</PublicPort>
+  <HttpServerPortNumber>${port}</HttpServerPortNumber>
+  <EnableHttps>false</EnableHttps>
+  <HttpsPortNumber>8920</HttpsPortNumber>
+  <PublicHttpsPort>8920</PublicHttpsPort>
+  <IsStartupWizardCompleted>true</IsStartupWizardCompleted>
+  <RunAtStartup>true</RunAtStartup>
+  <EnableUPnP>false</EnableUPnP>
+</ServerConfiguration>
+XMLEOF
+        if [ -f "${xml}" ]; then
+            log_msg "port sync: pre-seeded system.xml with port ${port}"
+            return 0
+        fi
+        log_msg "port sync FAILED: could not create ${xml}"
+        return 1
+    fi
+
+    # --- existing file: detect encoding ------------------------------------
+    local enc="ascii"
+    if [ -n "$(head -c 2 "${xml}" | od -An -tx1 | tr -d ' \n' | grep -iE '^fffe|^feff')" ]; then
+        enc="utf16"
+    elif LC_ALL=C grep -qP '[\x80-\xFF]' "${xml}" 2>/dev/null; then
+        enc="utf8-nonascii"
+    fi
+
+    local rc=0
+    if [ "${enc}" = "ascii" ] || [ "${enc}" = "utf8-nonascii" ]; then
+        # byte-safe for both ASCII and UTF-8
+        sed -i "s|<HttpServerPortNumber>[0-9]*</HttpServerPortNumber>|<HttpServerPortNumber>${port}</HttpServerPortNumber>|" "${xml}"
+        sed -i "s|<PublicPort>[0-9]*</PublicPort>|<PublicPort>${port}</PublicPort>|" "${xml}"
+        # node missing? sed matched nothing -> insert explicitly instead of failing
+        grep -aq '<HttpServerPortNumber>' "${xml}" || sed -i "0,/<ServerConfiguration[^>]*>/{s|<ServerConfiguration\([^>]*\)>|<ServerConfiguration\1>\n  <HttpServerPortNumber>${port}</HttpServerPortNumber>|}" "${xml}"
+        grep -aq '<PublicPort>' "${xml}" || sed -i "0,/<ServerConfiguration[^>]*>/{s|<ServerConfiguration\([^>]*\)>|<ServerConfiguration\1>\n  <PublicPort>${port}</PublicPort>|}" "${xml}"
+    else
+        # UTF-16: sed cannot be trusted; use python3 if available
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "${xml}" "${port}" <<'PYEOF'
+import re, sys
+path, port = sys.argv[1], sys.argv[2]
+with open(path, "rb") as fh:
+    raw = fh.read()
+if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+    enc = "utf-16"
+elif raw[:3] == b"\xef\xbb\xbf":
+    enc = "utf-8-sig"
+else:
+    enc = "utf-8"
+text = raw.decode(enc)
+for tag in ("HttpServerPortNumber", "PublicPort"):
+    text, n = re.subn(rf"<{tag}>\d+</{tag}>", f"<{tag}>{port}</{tag}>", text)
+    if n == 0:
+        # node missing -> insert it right after the root element opening tag
+        text = re.sub(
+            r"(<ServerConfiguration[^>]*>)",
+            rf"\1\n  <{tag}>{port}</{tag}>",
+            text, count=1,
+        )
+with open(path, "wb") as fh:
+    fh.write(text.encode(enc))
+PYEOF
+            rc=$?
+        else
+            log_msg "port sync FAILED: system.xml is UTF-16 and python3 is unavailable"
+            return 1
+        fi
+        if [ ${rc} -ne 0 ]; then
+            log_msg "port sync FAILED: python3 rewrite returned ${rc}"
+            return 1
+        fi
+    fi
+
+    # --- verify (never trust the editor's exit code; encoding-aware) -------
+    local public_port http_port
+    if [ "${enc}" = "utf16" ]; then
+        # grep cannot read UTF-16 reliably -> verify with python
+        public_port=$(python3 - "${xml}" <<'PYEOF'
+import re, sys
+raw = open(sys.argv[1], "rb").read()
+m = re.search(r"<PublicPort>(\d+)</PublicPort>", raw.decode("utf-16"))
+print(m.group(1) if m else "")
+PYEOF
+)
+        http_port=$(python3 - "${xml}" <<'PYEOF'
+import re, sys
+raw = open(sys.argv[1], "rb").read()
+m = re.search(r"<HttpServerPortNumber>(\d+)</HttpServerPortNumber>", raw.decode("utf-16"))
+print(m.group(1) if m else "")
+PYEOF
+)
+    else
+        public_port=$(grep -ao '<PublicPort>[0-9]*</PublicPort>' "${xml}" | grep -o '[0-9]*')
+        http_port=$(grep -ao '<HttpServerPortNumber>[0-9]*</HttpServerPortNumber>' "${xml}" | grep -o '[0-9]*')
+    fi
+
+    if [ "${public_port}" = "${port}" ] && [ "${http_port}" = "${port}" ]; then
+        log_msg "port sync: system.xml -> ${port} (encoding=${enc})"
+        return 0
+    fi
+
+    log_msg "port sync FAILED: expected ${port}, got PublicPort=${public_port} HttpServerPortNumber=${http_port} (encoding=${enc})"
+    return 1
+}
+
 start_process() {
     if status; then
         return 0
     fi
 
     log_msg "Starting process ..."
+
+    # route 1: the wizard value wins; only fall back to 8096 when unset
+    EMBY_PORT="${ui_port:-8096}"
+    if ! sync_emby_port "${EMBY_PORT}"; then
+        log_msg "WARNING: could not apply port ${EMBY_PORT}; Emby will use its stored value"
+    fi
+
     # run cmd to start process
     exec ${CMD} >> ${LOG_FILE} 2>&1 &
     # write pid to pidfile
