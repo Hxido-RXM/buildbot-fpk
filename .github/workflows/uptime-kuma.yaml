@@ -122,9 +122,9 @@ jobs:
           MANIFEST_VERSION="${{ steps.set_vars.outputs.manifest_version }}"
           CHANGELOG="${{ steps.set_vars.outputs.changelog }}"
           ESCAPED_CHANGELOG=$(printf '%s\n' "$CHANGELOG" | sed 's/[&/\]/\\&/g' | sed ':a;N;$!ba;s/\n/\\n/g')
-          sed -i "s/\${VERSION}/$MANIFEST_VERSION/g" "$MANIFEST_PATH"
-          sed -i "s/\${CHANGELOG}/$ESCAPED_CHANGELOG/g" "$MANIFEST_PATH"
-          sed -i "s/\${PLATFORM}/${{ matrix.platform }}/g" "$MANIFEST_PATH"
+          sed -i "s|${VERSION}|$MANIFEST_VERSION|g" "$MANIFEST_PATH"
+          sed -i "s|${CHANGELOG}|$ESCAPED_CHANGELOG|g" "$MANIFEST_PATH"
+          sed -i "s|${PLATFORM}|${{ matrix.platform }}|g" "$MANIFEST_PATH"
           echo "manifest 修改后的内容："
           cat "$MANIFEST_PATH"
 
