@@ -56,7 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BUILDBOT }}
         run: |
-          REPO="shuangji66/Fndepot"
+          REPO="Hxido-RXM/FnDepot"
           TAG="${{ steps.tag.outputs.tag }}"
           TITLE="${{ steps.tag.outputs.RELEASE_TITLE }}"
           APP_NAME="${{ inputs.app_name }}"
@@ -82,7 +82,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BUILDBOT }}
         run: |
-          REPO="shuangji66/Fndepot"
+          REPO="Hxido-RXM/FnDepot"
           TAG="${{ steps.tag.outputs.tag }}"
           APP_NAME="${{ inputs.app_name }}"
           VERSION="${{ inputs.manifest_version }}"
