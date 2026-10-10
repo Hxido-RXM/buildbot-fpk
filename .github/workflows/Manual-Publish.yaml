@@ -28,7 +28,7 @@ jobs:
       - name: 检出 Fndepot 仓库
         uses: actions/checkout@v7
         with:
-          repository: shuangji66/Fndepot
+          repository: Hxido-RXM/FnDepot
           token: ${{ secrets.BUILDBOT }}
           path: fndepot_repo
 
@@ -46,7 +46,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BUILDBOT }}
         run: |
-          REPO="shuangji66/Fndepot"
+          REPO="Hxido-RXM/FnDepot"
           APP_NAME="${{ github.event.inputs.app_name }}"
           TAG="${{ github.event.inputs.release_tag }}"
           VERSION="${{ github.event.inputs.manifest_version }}"
@@ -135,4 +135,4 @@ jobs:
           git add fnpack.json
           git commit -m "chore: manually update ${{ github.event.inputs.app_name }} to ${{ github.event.inputs.manifest_version }} (${{ github.event.inputs.release_tag }})"
           git push
-          echo "🚀 已推送到 shuangji66/Fndepot"
+          echo "🚀 已推送到 Hxido-RXM/FnDepot"
