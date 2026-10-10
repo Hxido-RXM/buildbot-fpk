@@ -1,5 +1,5 @@
 appname=Embyserver
-version=4.10.1.0
+version=4.10.1.0-1
 display_name=Emby
 desc="""<p>🎞️Emby将您的个人视频、音乐、照片以及实时电视内容整合在一起。</p><p>⭐使用说明：添加媒体库需在应用设置添加相应目录的权限。</p>"""
 platform=x86
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=Embyserver.Application
 checkport=true
 disable_authorization_path=false
-changelog="端口改由安装向导决定；启动时写入 Emby 配置，x86/arm 通用"
+changelog="新增 video 与 render 组权限，修复硬件转码打不开 drm 设备的问题；同时包含此前的安装向导端口修复"
