@@ -99,9 +99,9 @@ jobs:
           CHANGELOG="${{ steps.set_vars.outputs.changelog }}"
           sudo apt-get update && sudo apt-get install -y jq
           ESCAPED_CHANGELOG=$(printf '%s' "$CHANGELOG" | jq -sRr @json)
-          sed -i "s|${VERSION}|$MANIFEST_VERSION|g" "$MANIFEST_PATH"
-          sed -i "s|${CHANGELOG}|$ESCAPED_CHANGELOG|g" "$MANIFEST_PATH"
-          sed -i "s|${PLATFORM}|${{ matrix.platform }}|g" "$MANIFEST_PATH"
+          sed -i "s|\${VERSION}|$MANIFEST_VERSION|g" "$MANIFEST_PATH"
+          sed -i "s|\${CHANGELOG}|$ESCAPED_CHANGELOG|g" "$MANIFEST_PATH"
+          sed -i "s|\${PLATFORM}|${{ matrix.platform }}|g" "$MANIFEST_PATH"
           echo "manifest 修改后的内容："
           cat "$MANIFEST_PATH"
 
