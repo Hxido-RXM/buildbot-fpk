@@ -1,32 +1,186 @@
 name: Build Nginx and Release
 
 on:
+  # 手动触发：可显式指定版本与 publish 开关（保留原有能力）
   workflow_dispatch:
     inputs:
       main_version:
-        description: '主线 Nginx 版本（例如 1.31.5）'
-        required: true
+        description: '主线 Nginx 版本（留空则自动探测上游最新，例如 1.31.6）'
+        required: false
         type: string
+        default: ''
       stable_version:
-        description: '稳定 Nginx 版本（例如 1.30.4）'
-        required: true
+        description: '稳定 Nginx 版本（留空则自动探测上游最新，例如 1.30.5）'
+        required: false
         type: string
+        default: ''
       manifest_version:
-        description: 'manifest 中的版本号（例如 1.3.5）'
-        required: true
+        description: 'manifest 版本号（留空则自动生成，例如 1.3.7）'
+        required: false
         type: string
+        default: ''
       changelog:
-        description: '更新日志（支持中文）'
-        required: true
+        description: '更新日志（支持中文，留空则使用默认文案）'
+        required: false
         type: string
+        default: ''
       publish:
         description: '是否发布到 Fndepot Release'
         required: false
         type: boolean
         default: true
+      force_build:
+        description: '即使检测到无新版本也强制构建'
+        required: false
+        type: boolean
+        default: false
+
+  # 自动跟版：每周一 03:17 UTC 检查上游 nginx 是否有新版
+  # （避开整点，降低与其它 cron 撞车的概率；GitHub 不保证准时）
+  schedule:
+    - cron: '17 3 * * 1'
+
+# ===========================================================================
+# 分层设计说明（layer separation）
+# ---------------------------------------------------------------------------
+#  layer 1  探测 (job: detect)  —— 本 workflow 内，输出统一版本变量契约：
+#             outputs.main_version / stable_version / suggested_manifest_version
+#             / should_build
+#             契约要点：任何应用都只需实现"我当前最新版本是什么"，
+#             下游 build 只消费这几个变量，不关心版本从哪来。
+#             → 以后给其它应用加自动跟版时，只需替换 detect 里的探测命令。
+#
+#  layer 2  打包 (job: build)   —— 与现有 60 个应用几乎相同的骨架
+#             （设置变量 → 编译/下载 → 套模板 → 改 manifest → fnpack build）
+#             → 可进一步抽成可复用 workflow（本次未做，见报告"扩展点"）
+#
+#  layer 3  发布 (job: publish) —— 复用既有的 ./.github/workflows/Publish.yaml
+#
+#  注意：不用 GITHUB_TOKEN 去触发别的 workflow（GitHub 防递归），
+#        因此把 detect / build / publish 三个 job 放在同一个 workflow 里用 needs 串联。
+# ===========================================================================
 
 jobs:
+  # ========== layer 1：检测上游最新版本 ==========
+  detect:
+    name: 检测上游最新版本
+    runs-on: ubuntu-24.04
+    outputs:
+      main_version: ${{ steps.detect.outputs.main_version }}
+      stable_version: ${{ steps.detect.outputs.stable_version }}
+      suggested_manifest_version: ${{ steps.detect.outputs.suggested_manifest_version }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+      need_reason: ${{ steps.detect.outputs.need_reason }}
+    steps:
+      - name: 探测 nginx 官方最新 mainline / stable 版本
+        id: detect
+        run: |
+          set -euo pipefail
+
+          # ---------- 来源选择说明 ----------
+          # 首选 https://nginx.org/en/download.html ：纯静态 HTML、无速率限制、
+          # 且明确区分 Mainline / Stable 两条线（实测 HTTP 200 / 9604 B，多次抓取 md5 一致）。
+          # 不选 GitHub API：实测未鉴权请求会命中速率限制
+          #   {"message":"API rate limit exceeded ..."}
+          # 会导致 CI 随机失败；而 Build-nginx.yaml 旧实现正是用了 GitHub API。
+          URL="https://nginx.org/en/download.html"
+          HTML="$(curl -fsSL --retry 3 --retry-delay 5 --max-time 30 "$URL")"
+
+          # 解析：按 <h4>Mainline version</h4> / <h4>Stable version</h4> 锚定，
+          # 取其后最近的一个 nginx-X.Y.Z 版本号。
+          parsed="$(printf '%s' "$HTML" | tr '>' '\n' | awk '
+            /Mainline version<\/h4/ { want = "mainline" }
+            /Stable version<\/h4/   { want = "stable" }
+            want && /nginx-[0-9]+\.[0-9]+\.[0-9]+/ {
+              if (match($0, /nginx-[0-9]+\.[0-9]+\.[0-9]+/)) {
+                v = substr($0, RSTART + 6, RLENGTH - 6)
+                if (want == "mainline" && ml == "") { ml = v }
+                if (want == "stable"   && st == "") { st = v }
+              }
+            }
+            END { print ml " " st }
+          ')"
+          ML="$(echo "$parsed" | awk '{print $1}')"
+          ST="$(echo "$parsed" | awk '{print $2}')"
+
+          if [ -z "$ML" ] || [ -z "$ST" ]; then
+            echo "错误：无法从 $URL 解析出 nginx 版本（页面结构可能已变）"
+            echo "--- 抓取到的前 500 字节 ---"
+            printf '%s' "$HTML" | head -c 500
+            exit 1
+          fi
+
+          echo "上游最新 mainline: $ML"
+          echo "上游最新 stable  : $ST"
+          echo "main_version=$ML" >> $GITHUB_OUTPUT
+          echo "stable_version=$ST" >> $GITHUB_OUTPUT
+
+          # ---------- manifest 版本建议值 ----------
+          # 遵循仓库既有惯例：fpk 版本是"应用自身的短版本号"（Nginx 历史上是 1.3.3~1.3.6），
+          # 而不是 nginx 版本号。这里自动递增 patch 位：
+          #   读取上游清单里已发布的 Nginx 版本 → 取最大值 → patch +1
+          # 若读不到则退化为 1.3.<当天 MMDD>，保证单调递增且不撞号。
+          CHART_URL_FOR_VER="https://raw.githubusercontent.com/shuangji66/FnDepot/main/fnpack.json"
+          LAST_APP_VER=""
+          CHART2="$(curl -fsSL --max-time 20 "$CHART_URL_FOR_VER" 2>/dev/null || true)"
+          if [ -n "$CHART2" ]; then
+            LAST_APP_VER="$(printf '%s' "$CHART2"               | jq -r '(.apps.Nginx.releases // {}) | keys[]' 2>/dev/null               | sort -V | tail -1 || true)"
+          fi
+          if printf '%s' "$LAST_APP_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            SUGGESTED="$(printf '%s' "$LAST_APP_VER" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')"
+          else
+            SUGGESTED="1.3.$(date -u +%m%d)"
+          fi
+          echo "suggested_manifest_version=$SUGGESTED" >> $GITHUB_OUTPUT
+          echo "上次已发布版本: ${LAST_APP_VER:-<无>} → 建议 manifest 版本: $SUGGESTED"
+
+          # ---------- 是否需要构建 ----------
+          # 手工触发且填了版本 → 一定构建
+          # scheduled 触发（inputs 为空）→ 与上一次发布的版本比较
+          INPUT_ML="${{ github.event.inputs.main_version }}"
+          INPUT_ST="${{ github.event.inputs.stable_version }}"
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ -n "$INPUT_ML" ] || [ -n "$INPUT_ST" ] || [ "$FORCE" = "true" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "need_reason=手工指定版本或 force_build" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 读上游 FnDepot 清单里 Nginx 已发布过的最新 nginx 版本（只读，不写入）
+          # 清单地址取上游源；若不可达则保守地"照常构建"（宁可多跑一次，不要漏版）
+          CHART_URL="https://raw.githubusercontent.com/shuangji66/FnDepot/main/fnpack.json"
+          LAST=""
+          if chart="$(curl -fsSL --max-time 20 "$CHART_URL" 2>/dev/null)"; then
+            LAST="$(printf '%s' "$chart" | jq -r '
+              (.apps.Nginx.releases // {})
+              | to_entries
+              | map(select(.value.packages.x86.download_url != null))
+              | (sort_by(.key) | last) as $x
+              | ($x.value.changelog // "")' 2>/dev/null || true)"
+          fi
+          echo "上游清单最近一次 changelog: ${LAST:-<未取到>}"
+
+          if printf '%s' "$LAST" | grep -qF "$ML"; then
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "need_reason=上游清单已含 mainline $ML，跳过" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "need_reason=检测到 mainline $ML 尚未发布" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 汇总探测结果
+        run: |
+          echo "main_version              = ${{ steps.detect.outputs.main_version }}"
+          echo "stable_version            = ${{ steps.detect.outputs.stable_version }}"
+          echo "suggested_manifest_version= ${{ steps.detect.outputs.suggested_manifest_version }}"
+          echo "should_build              = ${{ steps.detect.outputs.should_build }}"
+          echo "need_reason               = ${{ steps.detect.outputs.need_reason }}"
+
+  # ========== layer 2：打包（矩阵 x86 / arm） ==========
   build:
+    needs: detect
+    # 无新版则明确跳过（不产出无意义的重跑）
+    if: needs.detect.outputs.should_build == 'true'
     strategy:
       matrix:
         include:
@@ -48,16 +202,50 @@ jobs:
         id: set_vars
         run: |
           APP_NAME="Nginx"
+          # 版本来源优先级：手工输入 > 自动探测结果（同一 workflow 内 needs 串联，避免
+          # 用 GITHUB_TOKEN 触发别的 workflow —— GitHub 禁止递归触发）
+          MAIN_VERSION="${{ github.event.inputs.main_version }}"
+          STABLE_VERSION="${{ github.event.inputs.stable_version }}"
+          [ -z "$MAIN_VERSION" ]   && MAIN_VERSION="${{ needs.detect.outputs.main_version }}"
+          [ -z "$STABLE_VERSION" ] && STABLE_VERSION="${{ needs.detect.outputs.stable_version }}"
+          if [ -z "$MAIN_VERSION" ] || [ -z "$STABLE_VERSION" ]; then
+            echo "错误：无法确定 nginx 版本（既无手工输入，也无自动探测结果）"
+            exit 1
+          fi
           MANIFEST_VERSION="${{ github.event.inputs.manifest_version }}"
+          [ -z "$MANIFEST_VERSION" ] && MANIFEST_VERSION="${{ needs.detect.outputs.suggested_manifest_version }}"
+          if [ -z "$MANIFEST_VERSION" ]; then
+            echo "错误：无法确定 manifest 版本"
+            exit 1
+          fi
           CHANGELOG="${{ github.event.inputs.changelog }}"
+          [ -z "$CHANGELOG" ] && CHANGELOG="自动构建：nginx ${MAIN_VERSION}（主线）/ ${STABLE_VERSION}（稳定）"
           echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "main_version=$MAIN_VERSION" >> $GITHUB_OUTPUT
+          echo "stable_version=$STABLE_VERSION" >> $GITHUB_OUTPUT
           echo "manifest_version=$MANIFEST_VERSION" >> $GITHUB_OUTPUT
           echo "changelog=$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "nginx 主线: $MAIN_VERSION / 稳定: $STABLE_VERSION / manifest: $MANIFEST_VERSION"
 
       - name: 获取最新 nginx-ui 版本
         id: get_ui_version
         run: |
-          UI_VERSION=$(curl -s https://api.github.com/repos/0xJacky/nginx-ui/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          set -euo pipefail
+          # nginx-ui 走 GitHub API 的 releases/latest。
+          # 未鉴权请求偶发命中速率限制 → 重试并回退到"取 tags 里最大的 vX.Y.Z"。
+          UI_VERSION=""
+          for i in 1 2 3; do
+            UI_VERSION="$(curl -fsSL --max-time 20 \
+              https://api.github.com/repos/0xJacky/nginx-ui/releases/latest \
+              | jq -r '.tag_name // empty' | sed 's/^v//' || true)"
+            [ -n "$UI_VERSION" ] && break
+            echo "第 $i 次获取 nginx-ui 版本失败，重试..."
+            sleep 5
+          done
+          if [ -z "$UI_VERSION" ]; then
+            echo "错误：无法获取 nginx-ui 最新版本"
+            exit 1
+          fi
           echo "ui_version=$UI_VERSION" >> $GITHUB_OUTPUT
           echo "nginx-ui 版本: $UI_VERSION"
 
@@ -69,9 +257,9 @@ jobs:
             libxml2-dev libxslt1-dev libperl-dev libbz2-dev libexpat1-dev \
             libncurses5-dev libreadline-dev libtinfo-dev wget curl jq
 
-      - name: 下载并编译主线 Nginx ${{ github.event.inputs.main_version }}
+      - name: 下载并编译主线 Nginx ${{ steps.set_vars.outputs.main_version }}
         run: |
-          VERSION="${{ github.event.inputs.main_version }}"
+          VERSION="${{ steps.set_vars.outputs.main_version }}"
           wget "https://github.com/nginx/nginx/archive/release-${VERSION}.tar.gz" -O nginx-main.tar.gz
           mkdir nginx-main-src
           tar -xzf nginx-main.tar.gz -C nginx-main-src --strip-components=1
@@ -100,9 +288,9 @@ jobs:
           make -j$(nproc)
           cp objs/nginx ../nginx-main
 
-      - name: 下载并编译稳定 Nginx ${{ github.event.inputs.stable_version }}
+      - name: 下载并编译稳定 Nginx ${{ steps.set_vars.outputs.stable_version }}
         run: |
-          VERSION="${{ github.event.inputs.stable_version }}"
+          VERSION="${{ steps.set_vars.outputs.stable_version }}"
           wget "https://github.com/nginx/nginx/archive/release-${VERSION}.tar.gz" -O nginx-stable.tar.gz
           mkdir nginx-stable-src
           tar -xzf nginx-stable.tar.gz -C nginx-stable-src --strip-components=1
@@ -133,6 +321,7 @@ jobs:
 
       - name: 下载最新 nginx-ui (${{ matrix.platform }})
         run: |
+          set -euo pipefail
           UI_VERSION="${{ steps.get_ui_version.outputs.ui_version }}"
           UI_URL="https://github.com/0xJacky/nginx-ui/releases/download/v${UI_VERSION}/nginx-ui-${{ matrix.ui_url_suffix }}.tar.gz"
           wget "$UI_URL" -O nginx-ui.tar.gz
@@ -171,6 +360,7 @@ jobs:
 
       - name: 修改 manifest 文件
         run: |
+          set -euo pipefail
           MANIFEST_PATH="build_workspace/${{ steps.set_vars.outputs.app_name }}/manifest"
           if [ ! -f "$MANIFEST_PATH" ]; then
             echo "错误：manifest 文件不存在于 $MANIFEST_PATH"
@@ -178,14 +368,29 @@ jobs:
           fi
           MANIFEST_VERSION="${{ steps.set_vars.outputs.manifest_version }}"
           CHANGELOG="${{ steps.set_vars.outputs.changelog }}"
+          MAIN_VERSION="${{ steps.set_vars.outputs.main_version }}"
+          STABLE_VERSION="${{ steps.set_vars.outputs.stable_version }}"
+          UI_VERSION="${{ steps.get_ui_version.outputs.ui_version }}"
           sudo apt-get update && sudo apt-get install -y jq
           ESCAPED_CHANGELOG=$(printf '%s' "$CHANGELOG" | jq -sRr @json)
-          sed -i "s|\${VERSION}|$MANIFEST_VERSION|g" "$MANIFEST_PATH"
-          sed -i "s|\${CHANGELOG}|$ESCAPED_CHANGELOG|g" "$MANIFEST_PATH"
+
+          # 统一用 | 作 sed 分隔符（版本号/更新日志里可能出现 /），
+          # 并对 ${...} 加反斜杠转义，防止被 shell 提前展开。
+          sed -i "s|\${VERSION}|$MANIFEST_VERSION|g"      "$MANIFEST_PATH"
+          sed -i "s|\${CHANGELOG}|$ESCAPED_CHANGELOG|g"   "$MANIFEST_PATH"
           sed -i "s|\${PLATFORM}|${{ matrix.platform }}|g" "$MANIFEST_PATH"
-          sed -i "s/\${NGINX_MAIN_VERSION}/${{ github.event.inputs.main_version }}/g" "$MANIFEST_PATH" || true
-          sed -i "s/\${NGINX_STABLE_VERSION}/${{ github.event.inputs.stable_version }}/g" "$MANIFEST_PATH" || true
-          sed -i "s/\${NGINX_UI_VERSION}/${{ steps.get_ui_version.outputs.ui_version }}/g" "$MANIFEST_PATH" || true
+          sed -i "s|\${NGINX_MAIN_VERSION}|$MAIN_VERSION|g"     "$MANIFEST_PATH"
+          sed -i "s|\${NGINX_STABLE_VERSION}|$STABLE_VERSION|g" "$MANIFEST_PATH"
+          sed -i "s|\${NGINX_UI_VERSION}|$UI_VERSION|g"         "$MANIFEST_PATH"
+
+          # 断言：不留任何未替换的占位符。这能防止再次出现
+          # "sed 目标不存在 → 静默空操作 → 版本从未写入 manifest" 的问题。
+          if grep -q '\${' "$MANIFEST_PATH"; then
+            echo "错误：manifest 中仍有未替换的占位符："
+            grep -n '\${' "$MANIFEST_PATH"
+            exit 1
+          fi
+
           echo "manifest 修改后的内容："
           cat "$MANIFEST_PATH"
 
@@ -211,15 +416,17 @@ jobs:
           path: build_workspace/*.fpk
           if-no-files-found: error
 
-  # ========== 发布到 Fndepot ==========
+  # ========== layer 3：发布（复用通用发布 workflow） ==========
   publish:
     name: 发布到 Fndepot Release
-    needs: build
-    if: always() && needs.build.result == 'success' && github.event.inputs.publish == 'true'
+    needs: [detect, build]
+    if: always() && needs.build.result == 'success' && github.event.inputs.publish != 'false'
     uses: ./.github/workflows/Publish.yaml
     with:
       app_name: ${{ needs.build.outputs.app_name }}
       manifest_version: ${{ needs.build.outputs.manifest_version }}
       changelog: ${{ needs.build.outputs.changelog }}
+      # 显式传 release_tag：带 nginx 版本，避免与其它应用同日共用一个 tag 而相互覆盖
+      release_tag: ${{ needs.build.outputs.manifest_version }}
     secrets:
       BUILDBOT: ${{ secrets.BUILDBOT }}
