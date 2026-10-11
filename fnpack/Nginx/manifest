@@ -13,4 +13,7 @@ desktop_uidir=ui
 desktop_applaunchname=Nginx.Application
 checkport=false
 disable_authorization_path=false
+nginx_main_version=${NGINX_MAIN_VERSION}
+nginx_stable_version=${NGINX_STABLE_VERSION}
+nginx_ui_version=${NGINX_UI_VERSION}
 changelog=${CHANGELOG}
