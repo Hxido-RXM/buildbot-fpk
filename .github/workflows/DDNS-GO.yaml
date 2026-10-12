@@ -1,28 +1,156 @@
 name: Build DDNS-GO and Release
 
 on:
+  # 手动触发：保留全部原有能力；版本/日志留空则自动探测（★ 兼容旧用法）
   workflow_dispatch:
     inputs:
       version:
-        description: '上游软件版本号（例如 6.16.17）'
-        required: true
+        description: '上游软件版本号（留空则自动探测最新，例如 6.17.7）'
+        required: false
         type: string
+        default: ''
       manifest_version:
-        description: 'manifest 中的版本号'
-        required: true
+        description: 'manifest 中的版本号（留空则自动生成）'
+        required: false
         type: string
+        default: ''
       changelog:
-        description: '更新日志（支持中文）'
-        required: true
+        description: '更新日志（支持中文，留空则用默认文案）'
+        required: false
         type: string
+        default: ''
       publish:
         description: '是否发布到 Fndepot Release'
         required: false
         type: boolean
         default: true
+      force_build:
+        description: '即使检测到无新版本也强制构建'
+        required: false
+        type: boolean
+        default: false
+
+  # 自动跟版：每周一 03:07 UTC（错峰——避开 Nginx 的 03:17 与其它 cron 整点）
+  schedule:
+    - cron: '7 3 * * 1'
 
 jobs:
+  # ========== layer 1：检测上游最新版本 ==========
+  detect:
+    name: 检测上游最新版本
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream_version: ${{ steps.detect.outputs.upstream_version }}
+      manifest_version: ${{ steps.detect.outputs.manifest_version }}
+      changelog: ${{ steps.detect.outputs.changelog }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+      need_reason: ${{ steps.detect.outputs.need_reason }}
+    steps:
+      - name: 探测上游最新版本
+        id: detect
+        env:
+          # 带 token 可将 API 限额从 60/h 提升到 5000/h（复用 Publish 已配置的 secret）
+          GH_TOKEN: ${{ secrets.BUILDBOT }}
+        run: |
+          set -euo pipefail
+
+          # ---------- 1) 取上游最新 tag ----------
+          # 注意：GitHub Actions runner 上直连 api.github.com 即可，不要写代理
+          TAG=""
+          if [ -n "${GH_TOKEN:-}" ]; then
+            TAG="$(curl -fsSL -H "Authorization: token $GH_TOKEN" \
+              --retry 3 --retry-delay 5 --max-time 30 \
+              "https://api.github.com/repos/jeessy2/ddns-go/releases/latest" \
+              | jq -r '.tag_name' 2>/dev/null || true)"
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            TAG="$(curl -fsSL --retry 3 --retry-delay 5 --max-time 30 \
+              "https://api.github.com/repos/jeessy2/ddns-go/releases/latest" \
+              | jq -r '.tag_name' 2>/dev/null || true)"
+          fi
+
+          # tag v6.17.7 -> 6.17.7（★ 去 v 前缀）
+          NEW_VERSION="$(printf '%s' "$TAG" | sed 's/^v//')"
+          if [ -z "$NEW_VERSION" ] || [ "$NEW_VERSION" = "null" ]; then
+            echo "::error::未能从 jeessy2/ddns-go 解析出版本号（tag=$TAG）"
+            exit 1
+          fi
+          echo "上游最新版本: $NEW_VERSION"
+          echo "upstream_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+          # ---------- 2) manifest 版本：手动优先，否则读已发布记录 +1 ----------
+          IN_MV="${{ github.event.inputs.manifest_version }}"
+          LAST=""
+          if [ -n "$IN_MV" ]; then
+            MV="$IN_MV"
+          else
+            # ★ 空值防护：fnpack.json 当前没有 DDNS-GO 键，(.apps[$app].releases // {}) + || true 必需
+            CHART="$(curl -fsSL --max-time 20 \
+              "https://raw.githubusercontent.com/Hxido-RXM/FnDepot/main/fnpack.json" 2>/dev/null || true)"
+            if [ -n "$CHART" ]; then
+              LAST="$(printf '%s' "$CHART" \
+                | jq -r '(.apps."DDNS-GO".releases // {}) | keys[]' 2>/dev/null \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V | tail -1 || true)"
+            fi
+            if [ -n "$LAST" ]; then
+              MV="$(printf '%s' "$LAST" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')"
+            else
+              # 首发回退：%y%m%d 保证跨年单调（1.0.251231 -> 1.0.260101）
+              MV="1.0.$(date -u +%y%m%d)"
+            fi
+          fi
+          echo "manifest_version=$MV" >> "$GITHUB_OUTPUT"
+          echo "上次已发布 manifest 版本: ${LAST:-<无>} → 本次建议: $MV"
+
+          # ---------- 3) changelog：必须含版本号串 ----------
+          # ★ 判据依赖 changelog 里能 grep 到版本号，默认文案必须把版本号写进去
+          IN_CL="${{ github.event.inputs.changelog }}"
+          CL="${IN_CL:-自动构建：ddns-go v${NEW_VERSION}}"
+          echo "changelog=$CL" >> "$GITHUB_OUTPUT"
+
+          # ---------- 4) 是否需要构建 ----------
+          IN_VER="${{ github.event.inputs.version }}"
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ -n "$IN_VER" ]; then
+            echo "should_build=true"  >> "$GITHUB_OUTPUT"
+            echo "need_reason=手工指定版本 $IN_VER" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$FORCE" = "true" ]; then
+            echo "should_build=true"  >> "$GITHUB_OUTPUT"
+            echo "need_reason=force_build" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 读已发布记录的 changelog，判断是否已含本次版本号
+          LAST_CL=""
+          if [ -n "$CHART" ]; then
+            LAST_CL="$(printf '%s' "$CHART" | jq -r \
+              '(.apps."DDNS-GO".releases // {}) | to_entries
+               | (sort_by(.key) | last) as $x
+               | ($x.value.changelog // "")' 2>/dev/null || true)"
+          fi
+          echo "已发布记录最近 changelog: ${LAST_CL:-<未取到>}"
+          if printf '%s' "$LAST_CL" | grep -qF "$NEW_VERSION"; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "need_reason=已发布过 $NEW_VERSION，跳过" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true"  >> "$GITHUB_OUTPUT"
+            echo "need_reason=检测到 $NEW_VERSION 尚未发布" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 汇总探测结果
+        run: |
+          echo "upstream_version  = ${{ steps.detect.outputs.upstream_version }}"
+          echo "manifest_version  = ${{ steps.detect.outputs.manifest_version }}"
+          echo "should_build      = ${{ steps.detect.outputs.should_build }}"
+          echo "need_reason       = ${{ steps.detect.outputs.need_reason }}"
+
+  # ========== layer 2：打包（矩阵 x86 / arm） ==========
   build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'   # ★ 无新版则明确跳过
     strategy:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
@@ -37,13 +165,22 @@ jobs:
         id: set_vars
         run: |
           APP_NAME="DDNS-GO"
+          # ★ 手动优先，留空回落 detect 输出（定时触发时 inputs 为空）
           VERSION="${{ github.event.inputs.version }}"
+          [ -z "$VERSION" ] && VERSION="${{ needs.detect.outputs.upstream_version }}"
           MANIFEST_VERSION="${{ github.event.inputs.manifest_version }}"
+          [ -z "$MANIFEST_VERSION" ] && MANIFEST_VERSION="${{ needs.detect.outputs.manifest_version }}"
           CHANGELOG="${{ github.event.inputs.changelog }}"
+          [ -z "$CHANGELOG" ] && CHANGELOG="${{ needs.detect.outputs.changelog }}"
+          if [ -z "$VERSION" ] || [ -z "$MANIFEST_VERSION" ]; then
+            echo "错误：上游版本号或 manifest 版本号为空"
+            exit 1
+          fi
           echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
           echo "upstream_version=$VERSION" >> $GITHUB_OUTPUT
           echo "manifest_version=$MANIFEST_VERSION" >> $GITHUB_OUTPUT
           echo "changelog=$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "上游版本: $VERSION / manifest 版本: $MANIFEST_VERSION"
 
       - name: 确定架构和平台标识
         id: arch
@@ -66,6 +203,7 @@ jobs:
           VERSION="${{ steps.set_vars.outputs.upstream_version }}"
           DOWNLOAD_ARCH="${{ steps.arch.outputs.download_arch }}"
           DOWNLOAD_URL="https://github.com/jeessy2/ddns-go/releases/download/v${VERSION}/ddns-go_${VERSION}_linux_${DOWNLOAD_ARCH}.tar.gz"
+          echo "下载地址: $DOWNLOAD_URL"
           wget "$DOWNLOAD_URL" -O ddns-go.tar.gz
           tar -xzf ddns-go.tar.gz
           chmod +x ddns-go
@@ -115,6 +253,12 @@ jobs:
           sed -i "s|\${PLATFORM}|${{ steps.arch.outputs.platform }}|g" "$MANIFEST_PATH"
           echo "manifest 修改后的内容："
           cat "$MANIFEST_PATH"
+          # ★ 断言：占位符必须全部替换（否则静默产出错误版本号的包）
+          if grep -qE '\$\{[A-Z_]+\}' "$MANIFEST_PATH"; then
+            echo "错误：manifest 中仍有未替换的占位符："
+            grep -oE '\$\{[A-Z_]+\}' "$MANIFEST_PATH" | sort -u
+            exit 1
+          fi
 
       - name: 执行 fnpack 打包
         run: |
@@ -138,15 +282,19 @@ jobs:
           path: build_workspace/*.fpk
           if-no-files-found: error
 
-  # ========== 发布到 Fndepot ==========
+  # ========== layer 3：发布到 Fndepot ==========
   publish:
     name: 发布到 Fndepot Release
     needs: build
-    if: always() && needs.build.result == 'success' && github.event.inputs.publish == 'true'
+    # ★ 关键修正：schedule 触发时 github.event.inputs.publish 为空，
+    #   原条件会导致"定时能构建但永不发布"；补上 event_name == 'schedule'
+    if: always() && needs.build.result == 'success' && (github.event_name == 'schedule' || github.event.inputs.publish == 'true')
     uses: ./.github/workflows/Publish.yaml
     with:
       app_name: ${{ needs.build.outputs.app_name }}
       manifest_version: ${{ needs.build.outputs.manifest_version }}
       changelog: ${{ needs.build.outputs.changelog }}
+      # ★ 显式传 release_tag（口径 A：变量形式，带应用名前缀），防跨应用同日撞 tag 互相覆盖
+      release_tag: ${{ needs.build.outputs.app_name }}-${{ needs.build.outputs.manifest_version }}
     secrets:
       BUILDBOT: ${{ secrets.BUILDBOT }}
